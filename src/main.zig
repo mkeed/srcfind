@@ -1,12 +1,41 @@
 const std = @import("std");
 const fs = @import("FileSystem.zig");
+const ta = @import("TracingAllocator.zig");
 
 const String = std.ArrayList(u8);
 const ScanItem = struct {
     name: String,
     id: i32,
+    contents: String,
     pub fn deinit(self: ScanItem) void {
         self.name.deinit();
+        self.contents.deinit();
+    }
+    pub fn init(alloc: std.mem.Allocator, id: i32, name: []const u8) !ScanItem {
+        var nameString = String.init(alloc);
+        errdefer nameString.deinit();
+        try nameString.appendSlice(name);
+
+        return ScanItem{
+            .name = nameString,
+            .id = id,
+            .contents = String.init(alloc),
+        };
+    }
+    pub fn updateFile(self: *ScanItem, dir: std.fs.Dir) !void {
+        var file = try dir.openFile(self.name.items, .{});
+        defer file.close();
+
+        const stat = try file.stat();
+        try self.contents.ensureTotalCapacity(stat.size);
+        self.contents.expandToCapacity();
+        _ = try file.readAll(self.contents.items);
+    }
+    pub fn initFile(alloc: std.mem.Allocator, id: i32, name: []const u8, dir: std.fs.Dir) !ScanItem {
+        var self = try ScanItem.init(alloc, id, name);
+        errdefer self.deinit();
+        try self.updateFile(dir);
+        return self;
     }
 };
 
@@ -37,22 +66,18 @@ pub const Scan = struct {
     }
 };
 
-pub fn scan(alloc: std.mem.Allocator, f: fs.FileSystem) !Scan {
+pub fn scan(alloc: std.mem.Allocator, f: fs.FileSystem, startDir: []const u8) !Scan {
     var scanItems = Scan.init(alloc);
     errdefer scanItems.deinit();
 
     var lookDir = std.ArrayList([]const u8).init(alloc);
     defer lookDir.deinit();
     {
-        var startDir = String.init(alloc);
-        errdefer startDir.deinit();
-        try startDir.appendSlice(".");
-        try lookDir.append(startDir.items);
-        try scanItems.dirs.append(.{
-            .name = startDir,
-            .id = try f.addDir(startDir.items),
-        });
+        try lookDir.append(startDir);
+        try scanItems.dirs.append(try ScanItem.init(alloc, try f.addDir(startDir), startDir));
     }
+    var name = std.ArrayList(u8).init(alloc);
+    defer name.deinit();
     var dir = std.fs.cwd();
     while (lookDir.popOrNull()) |dirName| {
         var iterDir = try dir.openIterableDir(dirName, .{});
@@ -60,25 +85,19 @@ pub fn scan(alloc: std.mem.Allocator, f: fs.FileSystem) !Scan {
         var iterator = iterDir.iterate();
         while (try iterator.next()) |item| {
             if (item.name[0] == '.') continue;
+            name.clearRetainingCapacity();
+            try std.fmt.format(name.writer(), "{s}/{s}", .{ dirName, item.name });
             switch (item.kind) {
                 .Directory => {
-                    var name = String.init(alloc);
-                    errdefer name.deinit();
-                    try std.fmt.format(name.writer(), "{s}/{s}", .{ dirName, item.name });
-                    try scanItems.dirs.append(.{
-                        .name = name,
-                        .id = try f.addDir(name.items),
-                    });
-                    try lookDir.append(name.items);
+                    var nitem = try ScanItem.init(alloc, try f.addDir(name.items), name.items);
+                    errdefer nitem.deinit();
+                    try lookDir.append(nitem.name.items);
+                    try scanItems.dirs.append(nitem);
                 },
                 .File => {
-                    var name = String.init(alloc);
-                    errdefer name.deinit();
-                    try std.fmt.format(name.writer(), "{s}/{s}", .{ dirName, item.name });
-                    try scanItems.files.append(.{
-                        .name = name,
-                        .id = try f.addFile(name.items),
-                    });
+                    var nitem = try ScanItem.initFile(alloc, try f.addDir(name.items), name.items, dir);
+                    errdefer nitem.deinit();
+                    try scanItems.files.append(nitem);
                 },
                 else => {},
             }
@@ -88,11 +107,16 @@ pub fn scan(alloc: std.mem.Allocator, f: fs.FileSystem) !Scan {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
     defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    const galloc = gpa.allocator();
+    var trace = ta.TracingAllocator().init(galloc);
+    //var trace = std.heap.LoggingAllocator(.debug, .err).init(galloc);
+    const alloc = trace.allocator();
+
     var f = try fs.FileSystem.init();
-    var s = try scan(alloc, f);
+    var s = try scan(alloc, f, ".");
+    std.log.info("total bytes:{}", .{gpa.total_requested_bytes});
     defer s.deinit();
     try f.readEvents();
 }
